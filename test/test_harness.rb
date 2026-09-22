@@ -639,12 +639,14 @@ module Harness
 
   class XMLData
     @@_room_title = nil
+    @@_room_exits = []
     @@_game = nil
     @@_server_time = nil
     @@_name = nil
 
     def self._reset
       @@_room_title = nil
+      @@_room_exits = []
       @@_game = nil
       @@_server_time = nil
       @@_name = nil
@@ -656,6 +658,14 @@ module Harness
 
     def self.room_title=(val)
       @@_room_title = val
+    end
+
+    def self.room_exits
+      @@_room_exits
+    end
+
+    def self.room_exits=(val)
+      @@_room_exits = val
     end
 
     # DR game instance code (e.g. 'DR' Prime, 'DRX' Platinum, 'DRF' Fallen,
@@ -825,6 +835,7 @@ module Harness
     Map._reset
     XMLData._reset
     UserVars._reset
+    Lich::DragonRealms::Creature._reset
   end
 
   def echo(message)
@@ -970,6 +981,20 @@ module Harness
 
   def right_hand
     $right_hand
+  end
+
+  def checkleft(*hand)
+    return nil if $left_hand.nil?
+
+    hand.flatten!
+    hand.empty? ? $left_hand : hand.find { |instance| $left_hand =~ /#{instance}/i }
+  end
+
+  def checkright(*hand)
+    return nil if $right_hand.nil?
+
+    hand.flatten!
+    hand.empty? ? $right_hand : hand.find { |instance| $right_hand =~ /#{instance}/i }
   end
 
   def waitrt?; end
@@ -1142,6 +1167,14 @@ module Harness
       def left_hand_noun; Harness._noun($left_hand); end
       def right_hand_noun; Harness._noun($right_hand); end
       def get_noun(long_name); Harness._noun(long_name); end
+
+      # Mirrors the real DRC.list_to_array: split a game item sentence on the
+      # comma/and separators, keeping the article that begins each item (so
+      # non-first items retain their leading space, exactly like production).
+      def list_to_array(list)
+        list.strip.split(%r{(?:,|(?:, |\s)?and\s?)(?:\s?<pushBold/>\s?)?(?=\s\ba\b|\s\ban\b|\s\bsome\b|\s\bthe\b)}i).reject(&:empty?)
+      end
+
       def get_gems(*_args); []; end
       def get_town_name(name); name; end
       def text2num(text); text; end
@@ -1156,6 +1189,8 @@ module Harness
       def retreat(*_args); end
       def rummage(*_args); end
       def log_window(*_args); end
+      def safe_pause_list(*_args); []; end
+      def safe_unpause_list(*_args); end
     end
   end
 
@@ -1245,14 +1280,17 @@ module Harness
       /You work carefully at tending/,
       /You work carefully at binding/,
       /That area has already been tended to/,
-      /That area is not bleeding/
+      /That area is not bleeding/,
+      /slips free/
     ].freeze
 
     TEND_FAILURE_PATTERNS = [
       /You fumble/,
       /too injured for you to do that/,
       /TEND allows for the tending of wounds/,
-      /^You must have a hand free/
+      /^You must have a hand free/,
+      /^You carelessly attempt/,
+      /^You foolishly attempt/
     ].freeze
 
     TEND_DISLODGE_PATTERNS = [
@@ -1346,6 +1384,57 @@ module Harness
 
     module Util
       def self.issue_command(*_args); []; end
+    end
+
+    module DragonRealms
+      # Stand-in for lich-5's creature registry (lib/dragonrealms/creature.rb).
+      # Real CreatureInstance objects expose id/noun/name plus status flags; a
+      # spec only needs to seed the room roster, so any object answering the
+      # attributes the script under test reads (an OpenStruct is plenty) works.
+      #
+      # in_room/targets ignore their status filters (:dead, :not_dead, :hostile,
+      # ...) and return whatever was seeded -- seed the roster you want the
+      # filtered call to produce. The filters are still recorded (in
+      # _in_room_filters / _targets_filters) so a spec can assert the script
+      # asked for the right ones. [] resolves a seeded creature by its id.
+      module Creature
+        @@_room = []
+        @@_in_room_filters = []
+        @@_targets_filters = []
+
+        def self._reset
+          @@_room = []
+          @@_in_room_filters = []
+          @@_targets_filters = []
+        end
+
+        # Seed the roster with an array of creature-like objects.
+        def self._set_room(creatures)
+          @@_room = creatures
+        end
+
+        def self._in_room_filters
+          @@_in_room_filters
+        end
+
+        def self._targets_filters
+          @@_targets_filters
+        end
+
+        def self.in_room(*filters)
+          @@_in_room_filters << filters
+          @@_room
+        end
+
+        def self.targets(*filters)
+          @@_targets_filters << filters
+          @@_room
+        end
+
+        def self.[](id)
+          @@_room.find { |creature| creature.id == id }
+        end
+      end
     end
   end
 end

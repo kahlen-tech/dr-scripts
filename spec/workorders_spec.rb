@@ -122,6 +122,26 @@ RSpec.describe WorkOrders do
       expect(match[:remaining]).to eq('3')
     end
 
+    it 'defines LOGBOOK_ITEM_PATTERN with named capture' do
+      pattern = described_class::LOGBOOK_ITEM_PATTERN
+      match = 'This logbook is tracking a work order requiring you to craft a curved metal shovel from any material.'.match(pattern)
+      expect(match).not_to be_nil
+      expect(match[:item]).to eq('a curved metal shovel')
+    end
+
+    it 'captures fabric items when remaining count is on the same line' do
+      line = 'This logbook is tracking a work order requiring you to craft a knitted napkin from any fabric.  You must bundle and deliver 1 more within the next 2 roisaen.'
+      match = line.match(described_class::LOGBOOK_ITEM_PATTERN)
+      expect(match).not_to be_nil
+      expect(match[:item]).to eq('a knitted napkin')
+      expect(line.match(described_class::LOGBOOK_REMAINING_PATTERN)[:remaining]).to eq('1')
+    end
+
+    it 'defines RESUME_LOGBOOK_PATTERNS as frozen array including LOGBOOK_ITEM_PATTERN' do
+      expect(described_class::RESUME_LOGBOOK_PATTERNS).to be_frozen
+      expect(described_class::RESUME_LOGBOOK_PATTERNS).to include(described_class::LOGBOOK_ITEM_PATTERN)
+    end
+
     it 'defines COUNT_PATTERN with named capture' do
       pattern = described_class::COUNT_PATTERN
       match = '42'.match(pattern)
@@ -169,7 +189,7 @@ RSpec.describe WorkOrders do
 
     it 'defines VERSION as frozen string' do
       expect(described_class::VERSION).to be_frozen
-      expect(described_class::VERSION).to eq('1.0.0')
+      expect(described_class::VERSION).to eq('1.0.2')
     end
   end
 
@@ -312,14 +332,107 @@ RSpec.describe WorkOrders do
     end
 
     context 'when work order is not complete' do
-      it 'handles incomplete work order response' do
+      it 'does not claim success when work order is incomplete' do
         allow(DRCI).to receive(:get_item?).and_return(true)
         allow(DRC).to receive(:release_invisibility)
         allow(DRC).to receive(:bput).and_return("The work order isn't yet complete")
+        allow(workorders).to receive(:logbook_remaining).and_return(1)
         expect(workorders).to receive(:stow_tool).with('logbook')
+        expect(Lich::Messaging).to receive(:msg).with('bold', /still needs 1 more.*not turned in/)
+        expect(Lich::Messaging).not_to receive(:msg).with('plain', 'WorkOrders: Work order completed and turned in')
 
         workorders.send(:complete_work_order, info)
       end
+    end
+  end
+
+  # ===========================================================================
+  # #logbook_remaining - read remaining item count from work order logbook
+  # ===========================================================================
+  describe '#logbook_remaining' do
+    it 'returns 0 when work order appears complete' do
+      expect(DRC).to receive(:bput).with('read my forging logbook', *described_class::READ_LOGBOOK_PATTERNS)
+                                 .and_return('This work order appears to be complete.')
+      expect(workorders.send(:logbook_remaining, 'forging')).to eq(0)
+    end
+
+    it 'returns remaining count from logbook text' do
+      expect(DRC).to receive(:bput).with('read my forging logbook', *described_class::READ_LOGBOOK_PATTERNS)
+                                 .and_return('You must bundle and deliver 1 more of the ordered item.')
+      expect(workorders.send(:logbook_remaining, 'forging')).to eq(1)
+    end
+
+    it 'returns nil when response is unreadable' do
+      expect(DRC).to receive(:bput).with('read my forging logbook', *described_class::READ_LOGBOOK_PATTERNS)
+                                 .and_return('I could not find what you were referring to.')
+      expect(workorders.send(:logbook_remaining, 'forging')).to be_nil
+    end
+  end
+
+  # ===========================================================================
+  # #resume_work_order - parse active order from logbook for continue
+  # ===========================================================================
+  describe '#resume_work_order' do
+    let(:recipes) do
+      [
+        { 'name' => 'a curved metal shovel', 'noun' => 'shovel', 'type' => 'blacksmithing' },
+        { 'name' => 'a metal razor', 'noun' => 'razor', 'type' => 'blacksmithing' }
+      ]
+    end
+
+    before do
+      allow(workorders).to receive(:stow_tool)
+    end
+
+    it 'returns recipe name and remaining count for an in-progress order' do
+      expect(DRCI).to receive(:get_item?).with('forging logbook').and_return(true)
+      # bput returns only the matched substring for the first matching pattern
+      expect(DRC).to receive(:bput).with('read my forging logbook', *described_class::RESUME_LOGBOOK_PATTERNS)
+                                 .and_return('This logbook is tracking a work order requiring you to craft a curved metal shovel from any')
+      expect(workorders).to receive(:logbook_remaining).with('forging').and_return(2)
+      expect(Lich::Messaging).to receive(:msg).with('plain', 'WorkOrders: Continuing work order for 2 a curved metal shovel')
+
+      expect(workorders.send(:resume_work_order, 'forging', recipes)).to eq(['a curved metal shovel', 2])
+    end
+
+    it 'parses knitted fabric orders from the truncated bput match' do
+      recipes = [{ 'name' => 'a knitted napkin', 'noun' => 'napkin', 'type' => 'tailoring', 'chapter' => 5 }]
+      expect(DRCI).to receive(:get_item?).with('outfitting logbook').and_return(true)
+      expect(DRC).to receive(:bput).with('read my outfitting logbook', *described_class::RESUME_LOGBOOK_PATTERNS)
+                                 .and_return('This logbook is tracking a work order requiring you to craft a knitted napkin from any')
+      expect(workorders).to receive(:logbook_remaining).with('outfitting').and_return(1)
+      expect(Lich::Messaging).to receive(:msg).with('plain', 'WorkOrders: Continuing work order for 1 a knitted napkin')
+
+      expect(workorders.send(:resume_work_order, 'outfitting', recipes)).to eq(['a knitted napkin', 1])
+    end
+
+    it 'returns quantity 0 when logbook order appears complete' do
+      expect(DRCI).to receive(:get_item?).with('forging logbook').and_return(true)
+      expect(DRC).to receive(:bput).with('read my forging logbook', *described_class::RESUME_LOGBOOK_PATTERNS)
+                                 .and_return('This work order appears to be complete.')
+      expect(Lich::Messaging).to receive(:msg).with('plain', 'WorkOrders: Logbook order complete - turning in')
+
+      expect(workorders.send(:resume_work_order, 'forging', recipes)).to eq([nil, 0])
+    end
+
+    it 'exits when logbook has no in-progress work order' do
+      expect(DRCI).to receive(:get_item?).with('forging logbook').and_return(true)
+      expect(DRC).to receive(:bput).with('read my forging logbook', *described_class::RESUME_LOGBOOK_PATTERNS)
+                                 .and_return('This logbook is not currently tracking a work order.')
+      expect(Lich::Messaging).to receive(:msg).with('bold', 'WorkOrders: No in-progress work order in forging logbook')
+      expect(workorders).to receive(:exit).and_raise(SystemExit)
+
+      expect { workorders.send(:resume_work_order, 'forging', recipes) }.to raise_error(SystemExit)
+    end
+
+    it 'exits when logbook item does not match a recipe' do
+      expect(DRCI).to receive(:get_item?).with('forging logbook').and_return(true)
+      expect(DRC).to receive(:bput).with('read my forging logbook', *described_class::RESUME_LOGBOOK_PATTERNS)
+                                 .and_return('This logbook is tracking a work order requiring you to craft a metal unknown widget from any')
+      expect(Lich::Messaging).to receive(:msg).with('bold', "WorkOrders: Could not match logbook item 'a metal unknown widget' to a recipe")
+      expect(workorders).to receive(:exit).and_raise(SystemExit)
+
+      expect { workorders.send(:resume_work_order, 'forging', recipes) }.to raise_error(SystemExit)
     end
   end
 
@@ -585,6 +698,92 @@ RSpec.describe WorkOrders do
         expect(Lich::Messaging).to receive(:msg).with('plain', 'WorkOrders: Tool repair at NPC completed')
 
         workorders.send(:repair_items, info, tools)
+      end
+    end
+
+    context 'when the clerk refuses the item outright' do
+      # The else branch must stow the tool; otherwise it is left in hand and
+      # the next iteration double-grabs or the trailing ticket loop misbehaves.
+      it 'stows a tool that gets no quote and no no-need response' do
+        allow(DRC).to receive(:bput).and_return("I don't repair those here")
+        allow(DRCI).to receive(:get_item?).with('Rangu ticket').and_return(false)
+
+        expect(workorders).to receive(:get_tool).with('hammer')
+        expect(workorders).to receive(:get_tool).with('tongs')
+        expect(workorders).to receive(:stow_tool).with('hammer')
+        expect(workorders).to receive(:stow_tool).with('tongs')
+
+        workorders.send(:repair_items, info, tools)
+      end
+    end
+  end
+
+  # ===========================================================================
+  # #confirm_repair - two-give handshake, incl. the re-quote after a bank run
+  # ===========================================================================
+  describe '#confirm_repair' do
+    let(:info) do
+      {
+        'repair-room' => 200,
+        'repair-npc'  => 'Rangu'
+      }
+    end
+
+    before do
+      allow(workorders).to receive(:get_tool)
+      allow(workorders).to receive(:stow_tool)
+      allow(DRCT).to receive(:walk_to)
+    end
+
+    context 'when the clerk finalizes on the first give' do
+      it 'stows the ticket' do
+        allow(DRC).to receive(:bput).and_return('You hand a clerk 190 Dokoras and he gives you back a repair ticket.')
+
+        expect(DRCI).to receive(:put_away_item?).with('ticket').and_return(true)
+
+        workorders.send(:confirm_repair, info, 'cauldron', 190)
+      end
+    end
+
+    context 'when short on coin and the clerk re-quotes after the bank run' do
+      # Regression: previously the post-withdrawal re-quote matched neither
+      # 'repair ticket' nor 'more coin', so bput timed out and the tool was
+      # skipped (workorders hung). The re-quote must now be consumed and the
+      # repair finalized on the following give.
+      it 'consumes the re-quote and finalizes the repair' do
+        responses = [
+          'A clerk shakes his head and says, "You will need more coin before I\'ll repair that."',
+          'A clerk looks over the cauldron and says, "That will cost 190 Dokoras to repair.  Just give it to me again if you want, and I\'ll have it ready in 1 roisaen."',
+          'You hand a clerk 190 Dokoras and he gives you back a repair ticket.'
+        ]
+        call = 0
+        allow(DRC).to receive(:bput) do |cmd, *_patterns|
+          next 'default' unless cmd.include?('give Rangu')
+
+          resp = responses[call]
+          call += 1
+          resp
+        end
+
+        expect(DRCM).to receive(:ensure_copper_on_hand).with(1900, anything, anything).and_return(true)
+        expect(workorders).to receive(:get_tool).with('cauldron')
+        expect(DRCI).to receive(:put_away_item?).with('ticket').and_return(true)
+
+        workorders.send(:confirm_repair, info, 'cauldron', 190)
+
+        expect(call).to eq(3)
+      end
+    end
+
+    context 'when the clerk repeatedly refuses for lack of coin' do
+      it 'gives up without finalizing a ticket' do
+        allow(DRC).to receive(:bput).and_return('A clerk shakes his head and says, "You will need more coin before I\'ll repair that."')
+        allow(DRCM).to receive(:ensure_copper_on_hand).and_return(true)
+
+        expect(DRCI).not_to receive(:put_away_item?).with('ticket')
+        expect(workorders).to receive(:stow_tool).with('cauldron').at_least(:once)
+
+        workorders.send(:confirm_repair, info, 'cauldron', 190)
       end
     end
   end
@@ -962,7 +1161,8 @@ RSpec.describe WorkOrders do
     let(:info) do
       {
         'stock-room' => 100,
-        'trash-room' => 200
+        'trash-room' => 200,
+        'logbook'    => 'forging'
       }
     end
     let(:materials_info) do
@@ -996,6 +1196,8 @@ RSpec.describe WorkOrders do
       allow(DRCT).to receive(:dispose)
       allow(DRC).to receive(:wait_for_script_to_complete)
       allow(workorders).to receive(:bundle_item)
+      # need one more -> craft once -> complete on next check (+ final status read)
+      allow(workorders).to receive(:logbook_remaining).and_return(1, 0, 0)
     end
 
     it 'stows ingot to crafting_container using DRCC.stow_crafting_item' do
@@ -1019,6 +1221,14 @@ RSpec.describe WorkOrders do
       allow(DRCC).to receive(:stow_crafting_item)
       expect(DRC).to receive(:wait_for_script_to_complete).with('smith', ['bronze', 'short sword'])
       workorders.send(:forge_items, info, materials_info, item, 1)
+    end
+
+    it 'crafts an extra item when logbook still needs one more after quantity' do
+      allow(DRCC).to receive(:stow_crafting_item)
+      # asked for 2; after two crafts still need 1; third craft completes
+      allow(workorders).to receive(:logbook_remaining).and_return(2, 1, 1, 0, 0)
+      expect(DRC).to receive(:wait_for_script_to_complete).with('smith', ['bronze', 'short sword']).exactly(3).times
+      workorders.send(:forge_items, info, materials_info, item, 2)
     end
   end
 
